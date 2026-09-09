@@ -1,0 +1,12 @@
+{
+  "name": "web-shooter-bridge",
+  "version": "1.0.0",
+  "description": "WebSocket bridge server — connects ESP32 device to the browser game",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

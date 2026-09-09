@@ -1,0 +1,9 @@
+export const DURATION_WEB    = 450;
+export const DURATION_HOLD   = 2400;
+export const DURATION_FADE   = 1400;
+export const TOTAL_WEB_LIFE  = DURATION_WEB + DURATION_HOLD + DURATION_FADE;
+export const HIT_RADIUS      = 115;
+export const SPIDER_CATCH_MS = 1100;
+export const SPIDER_INTERVAL = 1800;
+export const MAX_SPIDERS     = 8;
+export const INITIAL_LIVES   = 3;
