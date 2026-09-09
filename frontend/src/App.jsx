@@ -15,13 +15,20 @@ import { StatusBar } from './components/StatusBar';
 import { GameOverScreen } from './components/GameOverScreen';
 
 export default function App() {
-  const [target,   setTarget]   = useState({ x:window.innerWidth/2, y:window.innerHeight/2, normalizedX:0.5, normalizedY:0.5 });
-  const [locked,   setLocked]   = useState(false);
-  const [shots,    setShots]    = useState([]);
-  const [score,    setScore]    = useState(0);
-  const [lives,    setLives]    = useState(INITIAL_LIVES);
-  const [gameOver, setGameOver] = useState(false);
-  const [,         tick]        = useState(0);
+  const [target, setTarget] = useState({
+    x: window.innerWidth / 2,
+    y: window.innerHeight / 2,
+    normalizedX: 0.5,
+    normalizedY: 0.5,
+  });
+  const [locked, setLocked]       = useState(false);
+  const [shots, setShots]         = useState([]);
+  const [score, setScore]         = useState(0);
+  const [lives, setLives]         = useState(INITIAL_LIVES);
+  const [gameOver, setGameOver]   = useState(false);
+  const [aimSource, setAimSource] = useState('mouse'); // 'mouse' | 'cv' | 'imu'
+  const [imuData, setImuData]     = useState(null);
+  const [, tick]                  = useState(0);
 
   const lockTimerRef = useRef(null);
   const targetRef    = useRef(target);
@@ -30,7 +37,7 @@ export default function App() {
 
   useEffect(() => { targetRef.current = target; }, [target]);
 
-  // Keep escape callback fresh (reads latest lives/setGameOver)
+  // Keep escape callback fresh
   useEffect(() => {
     onEscapeRef.current = () => {
       setLives(prev => {
@@ -41,6 +48,7 @@ export default function App() {
     };
   });
 
+  // Shoot function (invoked by SPACE, ESP32 button, or wrist flick)
   const fireWeb = useCallback(() => {
     if (gameOver) return;
     const t = targetRef.current;
@@ -57,23 +65,59 @@ export default function App() {
     if (shot) setShots(prev => [...prev, shot]);
   }, [gameOver]);
 
-  // Hook up IoT device (ESP32)
-  const deviceConnected = useIoTBridge(fireWeb);
+  // Callback for OpenCV ArUco tracking or IMU targeting
+  const handleTargetUpdate = useCallback((normX, normY, source) => {
+    const x = normX * window.innerWidth;
+    const y = normY * window.innerHeight;
+    setTarget({
+      x,
+      y,
+      normalizedX: normX,
+      normalizedY: normY,
+    });
+    setAimSource(source || 'cv');
 
-  // Mouse tracking
+    // Auto-lock when steady
+    clearTimeout(lockTimerRef.current);
+    setLocked(false);
+    lockTimerRef.current = setTimeout(() => setLocked(true), 400);
+  }, []);
+
+  // Callback for MPU-6050 telemetry
+  const handleIMUUpdate = useCallback((data) => {
+    setImuData(data);
+  }, []);
+
+  // Hook up IoT device, OpenCV, and MPU-6050 via Bridge WebSocket
+  const { connected: bridgeConnected, deviceStatus } = useIoTBridge({
+    onShoot: fireWeb,
+    onTarget: handleTargetUpdate,
+    onIMU: handleIMUUpdate,
+  });
+
+  // Mouse tracking fallback
   useEffect(() => {
     const onMove = (e) => {
       const x = e.clientX, y = e.clientY;
-      setTarget({ x, y, normalizedX:+(x/window.innerWidth).toFixed(3), normalizedY:+(y/window.innerHeight).toFixed(3) });
+      setTarget({
+        x,
+        y,
+        normalizedX: +(x / window.innerWidth).toFixed(3),
+        normalizedY: +(y / window.innerHeight).toFixed(3),
+      });
+      setAimSource('mouse');
       setLocked(false);
       clearTimeout(lockTimerRef.current);
       lockTimerRef.current = setTimeout(() => setLocked(true), 650);
     };
     window.addEventListener('mousemove', onMove);
-    return () => { window.removeEventListener('mousemove', onMove); clearTimeout(lockTimerRef.current); };
+    return () => {
+      window.removeEventListener('mousemove', onMove);
+      clearTimeout(lockTimerRef.current);
+    };
   }, []);
 
-  // Keyboard
+  // Keyboard controls
   useEffect(() => {
     const onKeyDown = (e) => {
       if (gameOver) return;
@@ -87,7 +131,7 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [gameOver, fireWeb]);
 
-  // Spider spawner
+  // Spider spawner loop
   useEffect(() => {
     if (gameOver) return;
     const spawn = () => {
@@ -101,7 +145,7 @@ export default function App() {
     return () => clearInterval(id);
   }, [gameOver]);
 
-  // GC expired shots
+  // Expired shots garbage collector
   useEffect(() => {
     const id = setInterval(() => {
       const now = performance.now();
@@ -123,8 +167,19 @@ export default function App() {
       <GridBG />
       <GameLayer shots={shots} spidersRef={spidersRef} onEscapeRef={onEscapeRef} />
       <Crosshair target={target} locked={locked} />
-      <HUD target={target} score={score} spiderCount={spidersRef.current.length} lives={lives} />
-      <StatusBar deviceConnected={deviceConnected} />
+      <HUD
+        target={target}
+        score={score}
+        spiderCount={spidersRef.current.length}
+        lives={lives}
+        aimSource={aimSource}
+        imuData={imuData}
+      />
+      <StatusBar
+        bridgeConnected={bridgeConnected}
+        deviceStatus={deviceStatus}
+        aimSource={aimSource}
+      />
       {gameOver && <GameOverScreen score={score} onRestart={restart} />}
     </div>
   );

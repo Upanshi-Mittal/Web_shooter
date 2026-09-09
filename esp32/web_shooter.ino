@@ -1,172 +1,255 @@
 // ═══════════════════════════════════════════════════════════════
-//  Web Shooter — ESP32 Firmware
-//  Hardware: ESP32 dev board + push button
+//  Web Shooter V2 — ESP32 Firmware (Button + MPU-6050 IMU)
 //
-//  What it does:
-//    1. Connects to your WiFi
-//    2. When button is pressed → HTTP POST to the bridge server
-//    3. Bridge server forwards the "shoot" event to the browser game
+//  Hardware:
+//    - ESP32 Dev Module
+//    - Push Button (Active LOW: Pin -> Button -> GND)
+//    - MPU-6050 (6-DOF Accel + Gyro on I2C)
 //
 //  Wiring:
-//    Button → GPIO 0  (or change BUTTON_PIN below)
-//            → GND
-//    (use INPUT_PULLUP — no external resistor needed)
+//    MPU-6050 VCC  --> 3.3V (or 5V depending on board)
+//    MPU-6050 GND  --> GND
+//    MPU-6050 SDA  --> GPIO 21
+//    MPU-6050 SCL  --> GPIO 22
+//    Push Button   --> GPIO 0  (or set BUTTON_PIN below)
+//    Button GND    --> GND
 //
-//  Required Libraries (install via Arduino Library Manager):
-//    - WiFi       (built-in with ESP32 board package)
-//    - HTTPClient (built-in with ESP32 board package)
+//  Features:
+//    1. Button Press -> HTTP POST /shoot
+//    2. MPU-6050 Tilt Tracking -> HTTP POST /imu (Pitch & Roll)
+//    3. Wrist Flick / Thrust Gesture Detection -> Auto-shoot
 // ═══════════════════════════════════════════════════════════════
 
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <Wire.h>
 
-// ─── CONFIGURE THESE ─────────────────────────────────────────
-
+// ─── CONFIGURE YOUR NETWORK ──────────────────────────────────
 const char* WIFI_SSID     = "YOUR_WIFI_SSID";       // ← your WiFi name
 const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";   // ← your WiFi password
 
-// Copy the IP printed by the bridge server when you run: node backend/server.js
-const char* SERVER_IP   = "192.168.1.100";           // ← your computer's local IP
+// Server IP printed by: node backend/server.js
+const char* SERVER_IP   = "172.16.86.163";          // ← your computer's local IP
 const int   SERVER_PORT = 3001;
 
-// GPIO pin the button is connected to (other leg → GND)
-// GPIO 0 = built-in BOOT button on most ESP32 dev boards (great for testing)
-const int BUTTON_PIN = 0;
+// Hardware Pins
+const int BUTTON_PIN = 0;   // BOOT button or external push button
+const int LED_PIN    = 2;   // Onboard LED (-1 to disable)
+const int SDA_PIN    = 21;  // I2C Data
+const int SCL_PIN    = 22;  // I2C Clock
 
-// Optional: onboard LED pin for visual feedback
-// Most ESP32 dev boards have LED on GPIO 2. Set to -1 to disable.
-const int LED_PIN = 2;
+// MPU-6050 I2C Address (default 0x68)
+const uint8_t MPU_ADDR = 0x68;
+
+// Gesture Sensitivity
+const float FLICK_G_THRESHOLD = 2.4;  // G-force spike for flick shot
+const unsigned long FLICK_COOLDOWN_MS = 600;
+
+// Timing
+const unsigned long IMU_INTERVAL_MS   = 60;   // Stream IMU data every 60ms (~16Hz)
+const unsigned long COOLDOWN_MS       = 300;  // Button debounce cooldown
 
 // ─────────────────────────────────────────────────────────────
-
 String shootURL;
+String imuURL;
 
-// Debounce state
-bool          lastButtonState  = HIGH;
-bool          stableState      = HIGH;
+bool mpuAvailable = false;
+bool lastButtonState  = HIGH;
+bool stableState      = HIGH;
 unsigned long lastDebounceTime = 0;
-const unsigned long DEBOUNCE_MS = 50;
+const unsigned long DEBOUNCE_MS = 40;
 
-// Shot cooldown — prevent accidental double-fires
-unsigned long lastShotTime  = 0;
-const unsigned long COOLDOWN_MS = 300;
+unsigned long lastShotTime   = 0;
+unsigned long lastFlickTime  = 0;
+unsigned long lastIMUSend    = 0;
+unsigned long lastWiFiCheck  = 0;
 
-// WiFi reconnect
-unsigned long lastWiFiCheck = 0;
-const unsigned long WIFI_CHECK_INTERVAL = 5000;
+// Filtered tilt values
+float pitch = 0.0;
+float roll  = 0.0;
 
-// ─────────────────────────────────────────────────────────────
-
+// ─── SETUP ───────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
   delay(500);
 
-  Serial.println("\n╔══════════════════════════════════════════╗");
-  Serial.println("║    🕸  WEB SHOOTER — ESP32 DEVICE  🕸    ║");
-  Serial.println("╚══════════════════════════════════════════╝");
+  Serial.println("\n╔══════════════════════════════════════════════════╗");
+  Serial.println("║    🕸  WEB SHOOTER V2 — ESP32 + MPU6050  🕸       ║");
+  Serial.println("╚══════════════════════════════════════════════════╝");
 
-  // Button: active LOW with internal pull-up
   pinMode(BUTTON_PIN, INPUT_PULLUP);
-
-  // LED
   if (LED_PIN >= 0) {
     pinMode(LED_PIN, OUTPUT);
     digitalWrite(LED_PIN, LOW);
   }
 
-  // Build shoot URL once
+  // URLs
   shootURL = "http://" + String(SERVER_IP) + ":" + String(SERVER_PORT) + "/shoot";
-  Serial.println("Shoot URL: " + shootURL);
+  imuURL   = "http://" + String(SERVER_IP) + ":" + String(SERVER_PORT) + "/imu";
+
+  // Init I2C and MPU-6050
+  Wire.begin(SDA_PIN, SCL_PIN, 400000); // 400kHz Fast I2C
+  initMPU6050();
 
   connectWiFi();
 }
 
-// ─────────────────────────────────────────────────────────────
+// ─── INITIALIZE MPU-6050 (Direct Register Access) ────────────
+void initMPU6050() {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x6B); // PWR_MGMT_1 register
+  Wire.write(0x00); // Set to 0 to wake up MPU-6050
+  byte err = Wire.endTransmission();
 
+  if (err == 0) {
+    mpuAvailable = true;
+    Serial.println("[MPU6050] ✓ Sensor detected and initialized on I2C (0x68)");
+  } else {
+    mpuAvailable = false;
+    Serial.printf("[MPU6050] ✗ Sensor not found on I2C (error %d). Check wiring!\n", err);
+  }
+}
+
+// ─── MAIN LOOP ───────────────────────────────────────────────
 void loop() {
-  // WiFi watchdog — reconnect if dropped
-  if (millis() - lastWiFiCheck > WIFI_CHECK_INTERVAL) {
+  // 1. WiFi watchdog
+  if (millis() - lastWiFiCheck > 5000) {
     lastWiFiCheck = millis();
     if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("[WiFi] Lost connection — reconnecting...");
+      Serial.println("[WiFi] Connection lost, reconnecting...");
       connectWiFi();
     }
   }
 
-  // Read button with debounce
+  // 2. Read button with debounce
   bool reading = digitalRead(BUTTON_PIN);
-
   if (reading != lastButtonState) {
     lastDebounceTime = millis();
   }
-
   if (millis() - lastDebounceTime > DEBOUNCE_MS) {
     if (reading != stableState) {
       stableState = reading;
-
-      // Button PRESSED (LOW = pressed with INPUT_PULLUP)
-      if (stableState == LOW) {
+      if (stableState == LOW) { // Pressed (pull-up)
         unsigned long now = millis();
         if (now - lastShotTime > COOLDOWN_MS) {
           lastShotTime = now;
-          Serial.println("[BUTTON] Pressed → firing web shot!");
+          Serial.println("[BUTTON] Triggered -> Fire Web!");
           ledFlash(1);
-          sendShoot();
-        } else {
-          Serial.println("[BUTTON] Cooldown active — ignoring");
+          sendShoot("button");
         }
       }
     }
   }
-
   lastButtonState = reading;
+
+  // 3. Read and Process MPU-6050
+  if (mpuAvailable) {
+    int16_t rawAx, rawAy, rawAz, rawGx, rawGy, rawGz;
+    if (readRawMPU(rawAx, rawAy, rawAz, rawGx, rawGy, rawGz)) {
+      // Convert to Gs and deg/s
+      float ax = rawAx / 16384.0;
+      float ay = rawAy / 16384.0;
+      float az = rawAz / 16384.0;
+
+      // Acceleration magnitude
+      float totalG = sqrt(ax * ax + ay * ay + az * az);
+
+      // Flick gesture detection (sudden wrist snap forward)
+      unsigned long now = millis();
+      if (totalG > FLICK_G_THRESHOLD && (now - lastFlickTime > FLICK_COOLDOWN_MS)) {
+        lastFlickTime = now;
+        Serial.printf("[GESTURE] ⚡ Flick detected (%.2f G)! Firing Web!\n", totalG);
+        ledFlash(2);
+        sendShoot("gesture");
+      }
+
+      // Calculate tilt angles (Pitch & Roll in degrees)
+      float calcPitch = atan2(-ax, sqrt(ay * ay + az * az)) * 180.0 / PI;
+      float calcRoll  = atan2(ay, az) * 180.0 / PI;
+
+      // Low pass filter
+      pitch = 0.8 * pitch + 0.2 * calcPitch;
+      roll  = 0.8 * roll  + 0.2 * calcRoll;
+
+      // Send periodic IMU telemetry
+      if (now - lastIMUSend > IMU_INTERVAL_MS) {
+        lastIMUSend = now;
+        sendIMU(pitch, roll, ax, ay, az);
+      }
+    }
+  }
 }
 
-// ─────────────────────────────────────────────────────────────
+// ─── READ RAW MPU6050 SENSOR REGISTERS ───────────────────────
+bool readRawMPU(int16_t &ax, int16_t &ay, int16_t &az, int16_t &gx, int16_t &gy, int16_t &gz) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x3B); // Starting at register 0x3B (ACCEL_XOUT_H)
+  if (Wire.endTransmission(false) != 0) return false;
 
-void sendShoot() {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[HTTP] Not connected to WiFi — skipping");
-    return;
-  }
+  Wire.requestFrom(MPU_ADDR, (uint8_t)14, (uint8_t)true);
+  if (Wire.available() < 14) return false;
+
+  ax = (Wire.read() << 8) | Wire.read();
+  ay = (Wire.read() << 8) | Wire.read();
+  az = (Wire.read() << 8) | Wire.read();
+  Wire.read(); Wire.read(); // Skip temperature bytes
+  gx = (Wire.read() << 8) | Wire.read();
+  gy = (Wire.read() << 8) | Wire.read();
+  gz = (Wire.read() << 8) | Wire.read();
+  return true;
+}
+
+// ─── SEND SHOOT EVENT ────────────────────────────────────────
+void sendShoot(const char* source) {
+  if (WiFi.status() != WL_CONNECTED) return;
 
   HTTPClient http;
   http.begin(shootURL);
   http.addHeader("Content-Type", "application/json");
-  http.setTimeout(2000);  // 2s timeout — don't block the loop
+  http.setTimeout(1500);
 
-  int code = http.POST("{\"action\":\"shoot\",\"source\":\"esp32\"}");
-
-  if (code == 200) {
-    Serial.println("[HTTP] ✓ Shot sent successfully (200)");
-    ledFlash(2);  // double-flash confirms server received it
-  } else if (code > 0) {
-    Serial.printf("[HTTP] Server responded with code: %d\n", code);
-  } else {
-    Serial.printf("[HTTP] Request failed: %s\n", http.errorToString(code).c_str());
-  }
-
+  String payload = "{\"action\":\"shoot\",\"source\":\"" + String(source) + "\"}";
+  int code = http.POST(payload);
   http.end();
 }
 
+// ─── SEND IMU TELEMETRY ──────────────────────────────────────
+void sendIMU(float p, float r, float ax, float ay, float az) {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+  http.begin(imuURL);
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(300); // Very fast timeout so it never stalls loop
+
+  String payload = "{\"pitch\":" + String(p, 1) +
+                   ",\"roll\":" + String(r, 1) +
+                   ",\"ax\":" + String(ax, 2) +
+                   ",\"ay\":" + String(ay, 2) +
+                   ",\"az\":" + String(az, 2) +
+                   ",\"source\":\"imu\"}";
+  http.POST(payload);
+  http.end();
+}
+
+// ─── WIFI CONNECTION ─────────────────────────────────────────
 void connectWiFi() {
-  Serial.printf("[WiFi] Connecting to %s", WIFI_SSID);
+  Serial.printf("[WiFi] Connecting to: %s", WIFI_SSID);
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-    delay(500);
+  int tries = 0;
+  while (WiFi.status() != WL_CONNECTED && tries < 20) {
+    delay(400);
     Serial.print(".");
-    attempts++;
+    tries++;
   }
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\n[WiFi] ✓ Connected!");
-    Serial.println("[WiFi] IP address: " + WiFi.localIP().toString());
+    Serial.println("\n[WiFi] ✓ Connected! IP: " + WiFi.localIP().toString());
     ledFlash(3);
   } else {
-    Serial.println("\n[WiFi] ✗ Failed to connect. Will retry...");
+    Serial.println("\n[WiFi] ✗ Connect timeout. Will retry in background...");
   }
 }
 
@@ -174,8 +257,8 @@ void ledFlash(int times) {
   if (LED_PIN < 0) return;
   for (int i = 0; i < times; i++) {
     digitalWrite(LED_PIN, HIGH);
-    delay(80);
+    delay(70);
     digitalWrite(LED_PIN, LOW);
-    if (i < times - 1) delay(80);
+    if (i < times - 1) delay(70);
   }
 }

@@ -18,8 +18,8 @@ export function SpiderSVG({ spider, now }) {
   const alpha      = isCaught ? Math.max(0, 1 - catchElapsed / SPIDER_CATCH_MS) : 1;
   const hY         = y - 28;
   const bodyFill   = isCaught ? '#2a0000' : '#0c0c1e';
-  const bodyStroke = isCaught ? '#ff4444' : '#7788bb';
-  const legStroke  = isCaught ? '#ff6666' : '#6688aa';
+  const bodyStroke = isCaught ? '#ff4444' : '#ecedf1';
+  const legStroke  = isCaught ? '#ff6666' : '#ebeef1';
   const eyeColor   = isCaught ? '#ff8888' : '#ff1111';
 
   return (
