@@ -2,186 +2,237 @@ import React, { useState, useEffect, useRef } from 'react';
 import './index.css';
 
 // ─── CONFIG ────────────────────────────────────────────────
-const DEBUG_WEB       = false;
-const DURATION_LAUNCH = 180;   // ms: strand travels to target
-const DURATION_WEB    = 450;   // ms: web expands after impact
-const DURATION_HOLD   = 2400;  // ms: web stays fully visible
-const DURATION_FADE   = 1400;  // ms: fade out
-const TOTAL_LIFE      = DURATION_LAUNCH + DURATION_HOLD + DURATION_FADE; // ~3980ms
+const DURATION_WEB    = 450;
+const DURATION_HOLD   = 2400;
+const DURATION_FADE   = 1400;
+const TOTAL_WEB_LIFE  = DURATION_WEB + DURATION_HOLD + DURATION_FADE;
+const HIT_RADIUS      = 110;   // px — distance from target to catch a spider
+const SPIDER_CATCH_MS = 1100;  // ms caught spider stays before disappearing
+const SPIDER_INTERVAL = 2200;  // ms between new spiders
+const MAX_SPIDERS     = 7;
 
 // ─── MAKE SHOT ─────────────────────────────────────────────
 function makeShot(target) {
-  // Per-shot randomized web geometry
-  const numRadials    = 12 + Math.floor(Math.random() * 3);   // 12-14
-  const numRings      = 5  + Math.floor(Math.random() * 2);   // 5-6
-  const webRadius     = 180 + Math.floor(Math.random() * 60); // 180-240px — big like the screenshot
-  const ringSkew      = Array.from({ length: numRings }, () => 0.78 + Math.random() * 0.1); // sag 0.78-0.88
-  const radialJitter  = Array.from({ length: numRadials }, () => (Math.random() - 0.5) * 0.12); // ±0.06 rad angle noise
-  // Strand wobble control points (3 strands)
-  const strandOffsets = [
-    0,
-    (Math.random() - 0.5) * 28,
-    (Math.random() - 0.5) * 28,
-  ];
-
+  const numRadials = 12 + Math.floor(Math.random() * 3);
+  const numRings   =  5 + Math.floor(Math.random() * 2);
   const shot = {
     id: crypto.randomUUID(),
-    startX:      window.innerWidth / 2,
-    startY:      window.innerHeight - 60,
-    targetX:     target.x,
-    targetY:     target.y,
-    createdAt:   performance.now(),
+    targetX:      target.x,
+    targetY:      target.y,
+    createdAt:    performance.now(),
     numRadials,
     numRings,
-    webRadius,
-    ringSkew,
-    radialJitter,
-    strandOffsets,
+    webRadius:    180 + Math.floor(Math.random() * 60),
+    ringSkew:     Array.from({ length: numRings + 2 }, () => 0.78 + Math.random() * 0.10),
+    radialJitter: Array.from({ length: numRadials + 2 }, () => (Math.random() - 0.5) * 0.12),
   };
-
-  const valid = ['startX','startY','targetX','targetY'].every(k => Number.isFinite(shot[k]));
-  if (!valid) { console.warn('makeShot: bad coords', shot); return null; }
-  if (DEBUG_WEB) console.log('ACTIVE SHOT', shot);
+  if (!['targetX','targetY'].every(k => Number.isFinite(shot[k]))) return null;
   return shot;
 }
 
-// ─── SVG WEB PATH BUILDER ─────────────────────────────────
+// ─── MAKE SPIDER ───────────────────────────────────────────
+function makeSpider() {
+  const baseX = 80 + Math.random() * (window.innerWidth - 160);
+  return {
+    id:         crypto.randomUUID(),
+    baseX,
+    x:          baseX,
+    y:          -80,
+    vy:         0.045 + Math.random() * 0.065,  // px/ms → 45–110 px/s
+    swingAmp:   25 + Math.random() * 40,
+    swingFreq:  0.4 + Math.random() * 1.2,
+    swingPhase: Math.random() * Math.PI * 2,
+    state:      'falling',   // 'falling' | 'caught'
+    caughtAt:   null,
+    points:     10,
+  };
+}
+
+// ─── WEB PATH BUILDER ──────────────────────────────────────
 function buildWebPaths(shot, radius) {
   const { targetX: cx, targetY: cy, numRadials, numRings, ringSkew, radialJitter } = shot;
   const paths = [];
 
-  // Pre-compute every spoke angle once (base + per-spoke jitter)
-  const angles = Array.from({ length: numRadials }, (_, i) => {
-    const base = (i / numRadials) * Math.PI * 2;
-    return base + (radialJitter[i] || 0);
-  });
+  const angles = Array.from({ length: numRadials }, (_, i) =>
+    (i / numRadials) * Math.PI * 2 + (radialJitter[i] || 0)
+  );
 
-  // ── Radial spokes ──
   for (let i = 0; i < numRadials; i++) {
     const x2 = cx + Math.cos(angles[i]) * radius;
     const y2 = cy + Math.sin(angles[i]) * radius;
     paths.push({ type: 'radial', d: `M ${cx} ${cy} L ${x2.toFixed(1)} ${y2.toFixed(1)}` });
   }
 
-  // ── Concentric rings ──
   for (let r = 1; r <= numRings; r++) {
     const rr  = (radius / numRings) * r;
     const sag = ringSkew[r - 1] || 0.82;
-
-    // Ring points at every spoke
-    const pts = angles.map(a => ({
-      x: cx + Math.cos(a) * rr,
-      y: cy + Math.sin(a) * rr,
-    }));
-
+    const pts = angles.map(a => ({ x: cx + Math.cos(a) * rr, y: cy + Math.sin(a) * rr }));
     let d = `M ${pts[0].x.toFixed(1)} ${pts[0].y.toFixed(1)} `;
     for (let i = 0; i < numRadials; i++) {
       const p2 = pts[(i + 1) % numRadials];
-
-      // ← Key fix: normalize a2 > a1 so midAngle is always between them (no wraparound flip)
       const a1 = angles[i];
       let   a2 = angles[(i + 1) % numRadials];
       if (a2 < a1) a2 += Math.PI * 2;
       const aMid = (a1 + a2) / 2;
-
       const cpx = cx + Math.cos(aMid) * rr * sag;
       const cpy = cy + Math.sin(aMid) * rr * sag;
-
       d += `Q ${cpx.toFixed(1)} ${cpy.toFixed(1)} ${p2.x.toFixed(1)} ${p2.y.toFixed(1)} `;
     }
-    d += 'Z'; // close the ring cleanly
+    d += 'Z';
     paths.push({ type: 'ring', d: d.trim(), r });
   }
-
   return paths;
 }
 
-// ─── STRAND (one shot rendered in SVG) ────────────────────
+// ─── WEB STRAND COMPONENT ──────────────────────────────────
 function WebStrand({ shot, now }) {
   const elapsed = now - shot.createdAt;
-  if (elapsed > TOTAL_LIFE) return null;
+  if (elapsed > TOTAL_WEB_LIFE) return null;
 
-  // --- timing ---
-  const rawWebT  = Math.min(Math.max(elapsed, 0) / DURATION_WEB, 1);
-  const easeWeb  = 1 - Math.pow(1 - rawWebT, 3); // ease-out cubic
+  const rawWebT = Math.min(elapsed / DURATION_WEB, 1);
+  const easeWeb = 1 - Math.pow(1 - rawWebT, 3);
+  const holdEnd = DURATION_WEB + DURATION_HOLD;
+  const fadeT   = elapsed < holdEnd ? 0 : (elapsed - holdEnd) / DURATION_FADE;
+  const alpha   = Math.max(0, 1 - fadeT);
 
-  const holdEnd  = DURATION_LAUNCH + DURATION_HOLD;
-  const fadeT    = elapsed < holdEnd ? 0 : (elapsed - holdEnd) / DURATION_FADE;
-  const alpha    = Math.max(0, 1 - fadeT);
-
-  // --- web ---
   const webRadius = shot.webRadius * easeWeb;
   const webPaths  = rawWebT > 0 ? buildWebPaths(shot, webRadius) : [];
 
-  // --- impact ring flash ---
-  const impactT    = Math.min(elapsed / 250, 1);
+  const impactT    = Math.min(elapsed / 280, 1);
   const showImpact = impactT < 1;
 
   return (
     <g opacity={alpha}>
-      {/* ── Impact flash ring (expands outward on hit) ── */}
       {showImpact && (
-        <circle
-          cx={shot.targetX} cy={shot.targetY}
-          r={60 * impactT}
-          stroke="white"
-          strokeWidth={3 * (1 - impactT)}
-          fill="none"
-          opacity={1 - impactT}
-        />
+        <circle cx={shot.targetX} cy={shot.targetY}
+          r={65 * impactT} stroke="white"
+          strokeWidth={3 * (1 - impactT)} fill="none" opacity={1 - impactT} />
       )}
-
-      {/* ── Spider web structure ── */}
       {webPaths.map((p, i) => {
         const isRadial  = p.type === 'radial';
         const ringDepth = isRadial ? 0 : p.r / shot.numRings;
         return (
-          <path
-            key={i}
-            d={p.d}
-            stroke="white"
+          <path key={i} d={p.d} stroke="white" fill="none"
             strokeWidth={isRadial ? 1.0 : 1.4}
-            fill="none"
-            opacity={isRadial ? 0.65 : (0.95 - ringDepth * 0.18)}
-          />
+            opacity={isRadial ? 0.65 : (0.95 - ringDepth * 0.18)} />
         );
       })}
-
-      {/* ── Anchor dot at impact center ── */}
       <circle cx={shot.targetX} cy={shot.targetY} r="3.5" fill="white" opacity={0.95} />
-
-      {/* ── Small impact sparks ── */}
-      {showImpact && [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11].map(i => {
-        const a  = (i / 12) * Math.PI * 2;
-        const d  = 55 * impactT;
+      {showImpact && Array.from({ length: 12 }, (_, i) => {
+        const a = (i / 12) * Math.PI * 2;
         return (
-          <circle
-            key={i}
-            cx={shot.targetX + Math.cos(a) * d}
-            cy={shot.targetY + Math.sin(a) * d}
-            r={3 * (1 - impactT)}
-            fill="white"
-            opacity={1 - impactT}
-          />
+          <circle key={i}
+            cx={shot.targetX + Math.cos(a) * 58 * impactT}
+            cy={shot.targetY + Math.sin(a) * 58 * impactT}
+            r={3 * (1 - impactT)} fill="white" opacity={1 - impactT} />
         );
       })}
     </g>
   );
 }
 
-// ─── WEB LAYER (SVG, always on top) ───────────────────────
-function WebLayer({ shots }) {
+// ─── SPIDER LEG OFFSETS [kx, ky, tx, ty] from (x, headY) ─
+const LEG_R = [
+  [20, -22, 38, -14],
+  [24,  -8, 42,  -1],
+  [22,   8, 38,  20],
+  [17,  21, 28,  36],
+];
+
+// ─── SPIDER COMPONENT ──────────────────────────────────────
+function SpiderSVG({ spider, now }) {
+  const { x, y, state, caughtAt, points, baseX } = spider;
+  const isCaught    = state === 'caught';
+  const catchElapsed = isCaught ? now - caughtAt : 0;
+  if (isCaught && catchElapsed > SPIDER_CATCH_MS) return null;
+
+  const alpha      = isCaught ? Math.max(0, 1 - catchElapsed / SPIDER_CATCH_MS) : 1;
+  const hY         = y - 28;
+  const bodyFill   = isCaught ? '#2a0000' : '#0c0c1e';
+  const bodyStroke = isCaught ? '#ff4444' : '#7788bb';
+  const legStroke  = isCaught ? '#ff6666' : '#6688aa';
+  const eyeColor   = isCaught ? '#ff8888' : '#ff1111';
+
+  return (
+    <g opacity={alpha}>
+      {/* Silk thread from anchor at top to spider head */}
+      <line x1={baseX} y1={0} x2={x} y2={hY - 10}
+        stroke="white" strokeWidth="0.6" opacity="0.22" />
+
+      {/* Legs — right */}
+      {LEG_R.map(([kx, ky, tx, ty], i) => (
+        <path key={`r${i}`}
+          d={`M ${x} ${hY} L ${(x+kx).toFixed(1)} ${(hY+ky).toFixed(1)} L ${(x+tx).toFixed(1)} ${(hY+ty).toFixed(1)}`}
+          stroke={legStroke} strokeWidth="1.5" fill="none"
+          strokeLinecap="round" strokeLinejoin="round" />
+      ))}
+      {/* Legs — left (mirror) */}
+      {LEG_R.map(([kx, ky, tx, ty], i) => (
+        <path key={`l${i}`}
+          d={`M ${x} ${hY} L ${(x-kx).toFixed(1)} ${(hY+ky).toFixed(1)} L ${(x-tx).toFixed(1)} ${(hY+ty).toFixed(1)}`}
+          stroke={legStroke} strokeWidth="1.5" fill="none"
+          strokeLinecap="round" strokeLinejoin="round" />
+      ))}
+
+      {/* Abdomen */}
+      <ellipse cx={x} cy={y} rx={14} ry={16}
+        fill={bodyFill} stroke={bodyStroke} strokeWidth="1.5" />
+
+      {/* Cephalothorax */}
+      <ellipse cx={x} cy={hY} rx={10} ry={9}
+        fill={bodyFill} stroke={bodyStroke} strokeWidth="1.5" />
+
+      {/* Eyes */}
+      <circle cx={x - 4} cy={hY - 2} r="2.5" fill={eyeColor} />
+      <circle cx={x + 4} cy={hY - 2} r="2.5" fill={eyeColor} />
+
+      {/* Caught score popup */}
+      {isCaught && (
+        <text
+          x={x} y={hY - 32 - catchElapsed * 0.06}
+          textAnchor="middle"
+          fill="#00ff88" fontSize="22" fontWeight="bold"
+          fontFamily="'Courier New', monospace"
+          opacity={Math.max(0, 1 - catchElapsed / SPIDER_CATCH_MS)}
+        >
+          +{points}
+        </text>
+      )}
+    </g>
+  );
+}
+
+// ─── GAME LAYER — single SVG + single RAF ─────────────────
+function GameLayer({ shots, spidersRef }) {
   const [, setTick] = useState(0);
-  const rafRef = useRef(null);
+  const rafRef      = useRef(null);
+  const lastTRef    = useRef(performance.now());
 
   useEffect(() => {
-    const loop = () => {
+    const loop = (ts) => {
+      const dt  = Math.min(ts - lastTRef.current, 50);
+      lastTRef.current = ts;
+      const now = performance.now();
+
+      // Update spider positions & remove expired ones
+      const spiders = spidersRef.current;
+      for (let i = spiders.length - 1; i >= 0; i--) {
+        const s = spiders[i];
+        if (s.state === 'falling') {
+          s.y += s.vy * dt;
+          s.x  = s.baseX + Math.sin((ts / 1000) * s.swingFreq + s.swingPhase) * s.swingAmp;
+          if (s.y > window.innerHeight + 80) spiders.splice(i, 1);
+        } else if (s.state === 'caught' && now - s.caughtAt > SPIDER_CATCH_MS) {
+          spiders.splice(i, 1);
+        }
+      }
+
       setTick(t => t + 1);
       rafRef.current = requestAnimationFrame(loop);
     };
     rafRef.current = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(rafRef.current);
-  }, []);
+  }, [spidersRef]);
 
   const now = performance.now();
 
@@ -189,18 +240,15 @@ function WebLayer({ shots }) {
     <svg style={{
       position: 'fixed', inset: 0,
       width: '100vw', height: '100vh',
-      pointerEvents: 'none',
-      zIndex: 500,
-      overflow: 'visible',
+      pointerEvents: 'none', zIndex: 500, overflow: 'visible',
     }}>
-      {shots.map(shot => (
-        <WebStrand key={shot.id} shot={shot} now={now} />
-      ))}
+      {shots.map(s  => <WebStrand key={s.id}  shot={s}    now={now} />)}
+      {spidersRef.current.map(s => <SpiderSVG key={s.id} spider={s} now={now} />)}
     </svg>
   );
 }
 
-// ─── CROSSHAIR ────────────────────────────────────────────
+// ─── CROSSHAIR ─────────────────────────────────────────────
 function Crosshair({ target, locked }) {
   const color = locked ? '#ff3060' : '#4aedff';
   const glow  = locked ? '0 0 14px #ff3060, 0 0 28px #ff3060' : '0 0 10px #4aedff';
@@ -223,32 +271,41 @@ function Crosshair({ target, locked }) {
   );
 }
 
-// ─── HUD ──────────────────────────────────────────────────
-function HUD({ target, shotCount }) {
+// ─── HUD ───────────────────────────────────────────────────
+function HUD({ target, score, spiderCount }) {
   return (
-    <div style={{ position:'fixed', top:20, right:20, border:'1px solid #4aedff', background:'rgba(5,10,18,0.82)', padding:'14px 18px', borderRadius:4, boxShadow:'0 0 14px rgba(74,237,255,0.12)', zIndex:1000, lineHeight:1.85, minWidth:200 }}>
-      <div style={{ borderBottom:'1px solid #4aedff', paddingBottom:6, marginBottom:10, fontWeight:'bold', letterSpacing:2, fontSize:12 }}>WEB SHOOTER SYSTEM</div>
+    <div style={{ position:'fixed', top:20, right:20, border:'1px solid #4aedff', background:'rgba(5,10,18,0.88)', padding:'14px 18px', borderRadius:4, boxShadow:'0 0 14px rgba(74,237,255,0.12)', zIndex:1000, lineHeight:1.85, minWidth:200 }}>
+      <div style={{ borderBottom:'1px solid #4aedff', paddingBottom:6, marginBottom:10, fontWeight:'bold', letterSpacing:2, fontSize:12 }}>
+        WEB SHOOTER SYSTEM
+      </div>
       <div style={{ color:'#88aaff' }}>INPUT: MOUSE SIMULATION</div>
       <div style={{ color:'#00ffcc' }}>STATUS: ONLINE</div>
+
+      {/* Score */}
+      <div style={{ marginTop:14, borderTop:'1px solid #223', paddingTop:10 }}>
+        <div style={{ color:'#ffcc00', fontSize:11, letterSpacing:1 }}>SCORE</div>
+        <div style={{ color:'#ffcc00', fontSize:28, fontWeight:'bold', lineHeight:1.2 }}>
+          {String(score).padStart(6, '0')}
+        </div>
+        <div style={{ color:'#888', fontSize:11, marginTop:2 }}>
+          SPIDERS ACTIVE: {spiderCount}
+        </div>
+      </div>
+
       <div style={{ marginTop:12, color:'#88aaff' }}>TARGET</div>
       <div>X: {target.x.toFixed(0)}</div>
       <div>Y: {target.y.toFixed(0)}</div>
       <div style={{ marginTop:12, color:'#88aaff' }}>NORMALIZED</div>
       <div>X: {target.normalizedX.toFixed(3)}</div>
       <div>Y: {target.normalizedY.toFixed(3)}</div>
-      <div style={{ marginTop:12, color:'#ffaa00' }}>TRIGGER</div>
-      <div>[SPACE] SHOOT</div>
+      <div style={{ marginTop:12, color:'#ffaa00' }}>CONTROLS</div>
+      <div>[SPACE] SHOOT WEB</div>
       <div>[ESC] CLEAR</div>
-      {DEBUG_WEB && (
-        <div style={{ marginTop:10, borderTop:'1px solid #333', paddingTop:8, color:'#ff6600' }}>
-          ACTIVE SHOTS: {shotCount}
-        </div>
-      )}
     </div>
   );
 }
 
-// ─── STATUS BAR ───────────────────────────────────────────
+// ─── STATUS BAR ────────────────────────────────────────────
 function StatusBar() {
   return (
     <div style={{ position:'fixed', bottom:20, left:20, zIndex:1000, lineHeight:1.85, fontSize:12 }}>
@@ -263,7 +320,7 @@ function StatusBar() {
   );
 }
 
-// ─── GRID BG ──────────────────────────────────────────────
+// ─── GRID BG ───────────────────────────────────────────────
 function GridBG() {
   const w = window.innerWidth, h = window.innerHeight, step = 60;
   const lines = [];
@@ -276,17 +333,22 @@ function GridBG() {
   );
 }
 
-// ─── APP ──────────────────────────────────────────────────
+// ─── APP ───────────────────────────────────────────────────
 export default function App() {
   const [target, setTarget] = useState({
     x: window.innerWidth / 2, y: window.innerHeight / 2,
     normalizedX: 0.5, normalizedY: 0.5,
   });
-  const [locked, setLocked] = useState(false);
-  const [shots,  setShots]  = useState([]);
+  const [locked,  setLocked]  = useState(false);
+  const [shots,   setShots]   = useState([]);
+  const [score,   setScore]   = useState(0);
+  const [, forceUpdate]       = useState(0); // to re-render spider count
+
   const lockTimerRef = useRef(null);
   const targetRef    = useRef(target);
+  const spidersRef   = useRef([]);
 
+  // Keep target ref fresh
   useEffect(() => { targetRef.current = target; }, [target]);
 
   // Mouse tracking
@@ -308,31 +370,58 @@ export default function App() {
       if (e.code === 'Space') {
         e.preventDefault();
         const t = targetRef.current;
-        console.log('WEB SHOT TRIGGERED', t);
+
+        // Hit detection — catch any spider within HIT_RADIUS
+        let pointsEarned = 0;
+        spidersRef.current.forEach(s => {
+          if (s.state === 'falling' && Math.hypot(s.x - t.x, s.y - t.y) < HIT_RADIUS) {
+            s.state    = 'caught';
+            s.caughtAt = performance.now();
+            pointsEarned += s.points;
+          }
+        });
+        if (pointsEarned > 0) setScore(prev => prev + pointsEarned);
+
+        // Fire web
         const shot = makeShot(t);
         if (shot) setShots(prev => [...prev, shot]);
       }
-      if (e.code === 'Escape') setShots([]);
+      if (e.code === 'Escape') {
+        setShots([]);
+      }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
+  }, []);
+
+  // Spider spawner
+  useEffect(() => {
+    const spawn = () => {
+      if (spidersRef.current.length < MAX_SPIDERS) {
+        spidersRef.current.push(makeSpider());
+        forceUpdate(n => n + 1); // update spider count in HUD
+      }
+    };
+    spawn(); // spawn one immediately
+    const id = setInterval(spawn, SPIDER_INTERVAL);
+    return () => clearInterval(id);
   }, []);
 
   // GC expired shots
   useEffect(() => {
     const id = setInterval(() => {
       const now = performance.now();
-      setShots(prev => prev.filter(s => now - s.createdAt < TOTAL_LIFE + 100));
-    }, 400);
+      setShots(prev => prev.filter(s => now - s.createdAt < TOTAL_WEB_LIFE + 200));
+    }, 500);
     return () => clearInterval(id);
   }, []);
 
   return (
     <div style={{ width:'100vw', height:'100vh', position:'relative', overflow:'hidden' }}>
       <GridBG />
-      <WebLayer shots={shots} />
+      <GameLayer shots={shots} spidersRef={spidersRef} />
       <Crosshair target={target} locked={locked} />
-      <HUD target={target} shotCount={shots.length} />
+      <HUD target={target} score={score} spiderCount={spidersRef.current.length} />
       <StatusBar />
     </div>
   );
